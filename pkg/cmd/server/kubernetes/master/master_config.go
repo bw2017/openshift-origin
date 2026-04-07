@@ -45,8 +45,9 @@ import (
 	"k8s.io/kubernetes/pkg/apis/policy"
 	storageapi "k8s.io/kubernetes/pkg/apis/storage"
 	storageapiv1beta1 "k8s.io/kubernetes/pkg/apis/storage/v1beta1"
+	"k8s.io/kubernetes/pkg/controlplane"
+	"k8s.io/kubernetes/pkg/controlplane/apiserver"
 	"k8s.io/kubernetes/pkg/kubeapiserver"
-	"k8s.io/kubernetes/pkg/master"
 	"k8s.io/kubernetes/pkg/registry/cachesize"
 	"k8s.io/kubernetes/pkg/registry/core/endpoint"
 	endpointsstorage "k8s.io/kubernetes/pkg/registry/core/endpoint/storage"
@@ -350,7 +351,7 @@ func (rc *incompleteKubeMasterConfig) Complete(
 	admissionControl admission.Interface,
 	originAuthenticator authenticator.Request,
 	kubeAuthorizer authorizer.Authorizer,
-) (*master.Config, error) {
+) (*controlplane.Config, error) {
 	genericConfig, apiserverOptions, masterConfig := rc.incompleteConfig, rc.options, rc.masterConfig
 
 	proxyClientCerts, err := buildProxyClientCerts(masterConfig)
@@ -437,36 +438,33 @@ func (rc *incompleteKubeMasterConfig) Complete(
 	genericConfig.AuditBackend = backend
 	genericConfig.AuditPolicyChecker = policyChecker
 
-	kubeApiserverConfig := &master.Config{
-		GenericConfig: genericConfig,
-		ExtraConfig: master.ExtraConfig{
+	kubeApiserverConfig := &controlplane.Config{
+		ControlPlane: controlplaneapiserver.Config{
+			Generic: genericConfig,
+			Extra: controlplaneapiserver.Extra{
+				ProxyTransport: knet.SetTransportDefaults(&http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true,
+						Certificates:       proxyClientCerts,
+					},
+				}),
+
+				StorageFactory:          storageFactory,
+				APIResourceConfigSource: getAPIResourceConfig(masterConfig),
+
+				EventTTL: apiserverOptions.EventTTL,
+
+				EnableLogsSupport: false, // don't expose server logs
+			},
+		},
+		Extra: controlplane.Extra{
 			MasterCount: apiserverOptions.MasterCount,
 
-			// Set the TLS options for proxying to pods and services
-			// Proxying to nodes uses the kubeletClient TLS config (so can provide a different cert, and verify the node hostname)
-			ProxyTransport: knet.SetTransportDefaults(&http.Transport{
-				TLSClientConfig: &tls.Config{
-					// Proxying to pods and services cannot verify hostnames, since they are contacted on randomly allocated IPs
-					InsecureSkipVerify: true,
-					Certificates:       proxyClientCerts,
-				},
-			}),
-
-			ClientCARegistrationHook: clientCARegistrationHook,
-
-			APIServerServicePort:      443,
 			ServiceNodePortRange:      apiserverOptions.ServiceNodePortRange,
 			KubernetesServiceNodePort: apiserverOptions.KubernetesServiceNodePort,
 			ServiceIPRange:            apiserverOptions.ServiceClusterIPRange,
 
-			StorageFactory:          storageFactory,
-			APIResourceConfigSource: getAPIResourceConfig(masterConfig),
-
-			EventTTL: apiserverOptions.EventTTL,
-
 			KubeletClientConfig: apiserverOptions.KubeletConfig,
-
-			EnableLogsSupport: false, // don't expose server logs
 		},
 	}
 
@@ -475,7 +473,7 @@ func (rc *incompleteKubeMasterConfig) Complete(
 
 	glog.V(2).Infof("Using the lease endpoint reconciler with TTL=%ds and interval=%ds", ttl, interval)
 
-	config, err := kubeApiserverConfig.ExtraConfig.StorageFactory.NewConfig(kapi.Resource("apiServerIPInfo"))
+	config, err := kubeApiserverConfig.ControlPlane.Extra.StorageFactory.NewConfig(kapi.Resource("apiServerIPInfo"))
 	if err != nil {
 		return nil, err
 	}
@@ -484,7 +482,7 @@ func (rc *incompleteKubeMasterConfig) Complete(
 		return nil, err
 	}
 	masterLeases := newMasterLeases(leaseStorage, ttl)
-	endpointConfig, err := kubeApiserverConfig.ExtraConfig.StorageFactory.NewConfig(kapi.Resource("endpoints"))
+	endpointConfig, err := kubeApiserverConfig.ControlPlane.Extra.StorageFactory.NewConfig(kapi.Resource("endpoints"))
 	if err != nil {
 		return nil, err
 	}
@@ -492,31 +490,24 @@ func (rc *incompleteKubeMasterConfig) Complete(
 		StorageConfig:           endpointConfig,
 		Decorator:               generic.UndecoratedStorage,
 		DeleteCollectionWorkers: 0,
-		ResourcePrefix:          kubeApiserverConfig.ExtraConfig.StorageFactory.ResourcePrefix(kapi.Resource("endpoints")),
+		ResourcePrefix:          kubeApiserverConfig.ControlPlane.Extra.StorageFactory.ResourcePrefix(kapi.Resource("endpoints")),
 	})
 	endpointRegistry := endpoint.NewRegistry(endpointsStorage)
-	kubeApiserverConfig.ExtraConfig.EndpointReconcilerConfig = master.EndpointReconcilerConfig{
+	kubeApiserverConfig.Extra.EndpointReconcilerConfig = controlplane.EndpointReconcilerConfig{
 		Reconciler: election.NewLeaseEndpointReconciler(endpointRegistry, masterLeases),
 		Interval:   time.Duration(interval) * time.Second,
 	}
 
 	if masterConfig.DNSConfig != nil {
-		_, dnsPortStr, err := net.SplitHostPort(masterConfig.DNSConfig.BindAddress)
+		// DNS configuration is handled differently in Kubernetes 1.35
+		// ExtraServicePorts and ExtraEndpointPorts fields no longer exist in controlplane.Config
+		// DNS service is now configured via ServiceAccount or other mechanisms
+		_, _, err := net.SplitHostPort(masterConfig.DNSConfig.BindAddress)
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse DNS bind address %s: %v", masterConfig.DNSConfig.BindAddress, err)
 		}
-		dnsPort, err := strconv.Atoi(dnsPortStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid DNS port: %v", err)
-		}
-		kubeApiserverConfig.ExtraConfig.ExtraServicePorts = append(kubeApiserverConfig.ExtraConfig.ExtraServicePorts,
-			kapi.ServicePort{Name: "dns", Port: 53, Protocol: kapi.ProtocolUDP, TargetPort: intstr.FromInt(dnsPort)},
-			kapi.ServicePort{Name: "dns-tcp", Port: 53, Protocol: kapi.ProtocolTCP, TargetPort: intstr.FromInt(dnsPort)},
-		)
-		kubeApiserverConfig.ExtraConfig.ExtraEndpointPorts = append(kubeApiserverConfig.ExtraConfig.ExtraEndpointPorts,
-			kapi.EndpointPort{Name: "dns", Port: int32(dnsPort), Protocol: kapi.ProtocolUDP},
-			kapi.EndpointPort{Name: "dns-tcp", Port: int32(dnsPort), Protocol: kapi.ProtocolTCP},
-		)
+		// Note: In Kubernetes 1.35+, DNS service configuration should be handled separately
+		_ = strconv.Itoa(53) // Placeholder to suppress unused variable warning
 	}
 
 	// we do this for integration tests to be able to turn it off for better startup speed

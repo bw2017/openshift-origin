@@ -18,213 +18,124 @@ package handler
 
 import (
 	"bytes"
-	"compress/gzip"
 	"crypto/sha512"
-	"encoding/json"
 	"fmt"
-	"mime"
 	"net/http"
-	"strings"
-	"sync"
+	"strconv"
 	"time"
 
-	"bitbucket.org/ww/goautoneg"
-
-	yaml "gopkg.in/yaml.v2"
-
 	"github.com/NYTimes/gziphandler"
-	restful "github.com/emicklei/go-restful"
-	"github.com/go-openapi/spec"
-	"github.com/golang/protobuf/proto"
-	openapi_v2 "github.com/googleapis/gnostic/OpenAPIv2"
-	"github.com/googleapis/gnostic/compiler"
+	"github.com/emicklei/go-restful/v3"
+	openapi_v2 "github.com/google/gnostic-models/openapiv2"
+	"github.com/google/uuid"
+	"github.com/munnerz/goautoneg"
+	"google.golang.org/protobuf/proto"
 
+	klog "k8s.io/klog/v2"
 	"k8s.io/kube-openapi/pkg/builder"
+	"k8s.io/kube-openapi/pkg/cached"
 	"k8s.io/kube-openapi/pkg/common"
+	"k8s.io/kube-openapi/pkg/common/restfuladapter"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 const (
-	jsonExt = ".json"
-
-	mimeJson = "application/json"
-	// TODO(mehdy): change @68f4ded to a version tag when gnostic add version tags.
-	mimePb   = "application/com.github.googleapis.gnostic.OpenAPIv2@68f4ded+protobuf"
-	mimePbGz = "application/x-gzip"
+	subTypeProtobufDeprecated = "com.github.proto-openapi.spec.v2@v1.0+protobuf"
+	subTypeProtobuf           = "com.github.proto-openapi.spec.v2.v1.0+protobuf"
+	subTypeJSON               = "json"
 )
+
+func computeETag(data []byte) string {
+	if data == nil {
+		return ""
+	}
+	return fmt.Sprintf("%X", sha512.Sum512(data))
+}
+
+type timedSpec struct {
+	spec         []byte
+	lastModified time.Time
+}
 
 // OpenAPIService is the service responsible for serving OpenAPI spec. It has
 // the ability to safely change the spec while serving it.
 type OpenAPIService struct {
-	// rwMutex protects All members of this service.
-	rwMutex sync.RWMutex
-
-	lastModified time.Time
-
-	specBytes []byte
-	specPb    []byte
-	specPbGz  []byte
-
-	specBytesETag string
-	specPbETag    string
-	specPbGzETag  string
+	specCache  cached.LastSuccess[*spec.Swagger]
+	jsonCache  cached.Value[timedSpec]
+	protoCache cached.Value[timedSpec]
 }
 
-func init() {
-	mime.AddExtensionType(".json", mimeJson)
-	mime.AddExtensionType(".pb-v1", mimePb)
-	mime.AddExtensionType(".gz", mimePbGz)
+// NewOpenAPIService builds an OpenAPIService starting with the given spec.
+func NewOpenAPIService(swagger *spec.Swagger) *OpenAPIService {
+	return NewOpenAPIServiceLazy(cached.Static(swagger, uuid.New().String()))
 }
 
-func computeETag(data []byte) string {
-	return fmt.Sprintf("\"%X\"", sha512.Sum512(data))
+// NewOpenAPIServiceLazy builds an OpenAPIService from lazy spec.
+func NewOpenAPIServiceLazy(swagger cached.Value[*spec.Swagger]) *OpenAPIService {
+	o := &OpenAPIService{}
+	o.UpdateSpecLazy(swagger)
+
+	o.jsonCache = cached.Transform[*spec.Swagger](func(spec *spec.Swagger, etag string, err error) (timedSpec, string, error) {
+		if err != nil {
+			return timedSpec{}, "", err
+		}
+		json, err := spec.MarshalJSON()
+		if err != nil {
+			return timedSpec{}, "", err
+		}
+		return timedSpec{spec: json, lastModified: time.Now()}, computeETag(json), nil
+	}, &o.specCache)
+	o.protoCache = cached.Transform(func(ts timedSpec, etag string, err error) (timedSpec, string, error) {
+		if err != nil {
+			return timedSpec{}, "", err
+		}
+		proto, err := ToProtoBinary(ts.spec)
+		if err != nil {
+			return timedSpec{}, "", err
+		}
+		// We can re-use the same etag as json because of the Vary header.
+		return timedSpec{spec: proto, lastModified: ts.lastModified}, etag, nil
+	}, o.jsonCache)
+	return o
 }
 
-// NOTE: [DEPRECATION] We will announce deprecation for format-separated endpoints for OpenAPI spec,
-// and switch to a single /openapi/v2 endpoint in Kubernetes 1.10. The design doc and deprecation process
-// are tracked at: https://docs.google.com/document/d/19lEqE9lc4yHJ3WJAJxS_G7TcORIJXGHyq3wpwcH28nU.
-//
-// BuildAndRegisterOpenAPIService builds the spec and registers a handler to provide access to it.
-// Use this method if your OpenAPI spec is static. If you want to update the spec, use BuildOpenAPISpec then RegisterOpenAPIService.
-func BuildAndRegisterOpenAPIService(servePath string, webServices []*restful.WebService, config *common.Config, handler common.PathHandler) (*OpenAPIService, error) {
-	spec, err := builder.BuildOpenAPISpec(webServices, config)
-	if err != nil {
-		return nil, err
-	}
-	return RegisterOpenAPIService(spec, servePath, handler)
-}
-
-// NOTE: [DEPRECATION] We will announce deprecation for format-separated endpoints for OpenAPI spec,
-// and switch to a single /openapi/v2 endpoint in Kubernetes 1.10. The design doc and deprecation process
-// are tracked at: https://docs.google.com/document/d/19lEqE9lc4yHJ3WJAJxS_G7TcORIJXGHyq3wpwcH28nU.
-//
-// RegisterOpenAPIService registers a handler to provide access to provided swagger spec.
-// Note: servePath should end with ".json" as the RegisterOpenAPIService assume it is serving a
-// json file and will also serve .pb and .gz files.
-func RegisterOpenAPIService(openapiSpec *spec.Swagger, servePath string, handler common.PathHandler) (*OpenAPIService, error) {
-	if !strings.HasSuffix(servePath, jsonExt) {
-		return nil, fmt.Errorf("serving path must end with \"%s\"", jsonExt)
-	}
-
-	servePathBase := strings.TrimSuffix(servePath, jsonExt)
-
-	o := OpenAPIService{}
-	if err := o.UpdateSpec(openapiSpec); err != nil {
-		return nil, err
-	}
-
-	type fileInfo struct {
-		ext            string
-		getDataAndETag func() ([]byte, string, time.Time)
-	}
-
-	files := []fileInfo{
-		{".json", o.getSwaggerBytes},
-		{"-2.0.0.json", o.getSwaggerBytes},
-		{"-2.0.0.pb-v1", o.getSwaggerPbBytes},
-		{"-2.0.0.pb-v1.gz", o.getSwaggerPbGzBytes},
-	}
-
-	for _, file := range files {
-		path := servePathBase + file.ext
-		getDataAndETag := file.getDataAndETag
-		handler.Handle(path, gziphandler.GzipHandler(http.HandlerFunc(
-			func(w http.ResponseWriter, r *http.Request) {
-				data, etag, lastModified := getDataAndETag()
-				w.Header().Set("Etag", etag)
-
-				// ServeContent will take care of caching using eTag.
-				http.ServeContent(w, r, path, lastModified, bytes.NewReader(data))
-			}),
-		))
-	}
-
-	return &o, nil
-}
-
-func (o *OpenAPIService) getSwaggerBytes() ([]byte, string, time.Time) {
-	o.rwMutex.RLock()
-	defer o.rwMutex.RUnlock()
-	return o.specBytes, o.specBytesETag, o.lastModified
-}
-
-func (o *OpenAPIService) getSwaggerPbBytes() ([]byte, string, time.Time) {
-	o.rwMutex.RLock()
-	defer o.rwMutex.RUnlock()
-	return o.specPb, o.specPbETag, o.lastModified
-}
-
-func (o *OpenAPIService) getSwaggerPbGzBytes() ([]byte, string, time.Time) {
-	o.rwMutex.RLock()
-	defer o.rwMutex.RUnlock()
-	return o.specPbGz, o.specPbGzETag, o.lastModified
-}
-
-func (o *OpenAPIService) UpdateSpec(openapiSpec *spec.Swagger) (err error) {
-	specBytes, err := json.MarshalIndent(openapiSpec, " ", " ")
-	if err != nil {
-		return err
-	}
-	specPb, err := toProtoBinary(specBytes)
-	if err != nil {
-		return err
-	}
-	specPbGz := toGzip(specPb)
-
-	specBytesETag := computeETag(specBytes)
-	specPbETag := computeETag(specPb)
-	specPbGzETag := computeETag(specPbGz)
-
-	lastModified := time.Now()
-
-	o.rwMutex.Lock()
-	defer o.rwMutex.Unlock()
-
-	o.specBytes = specBytes
-	o.specPb = specPb
-	o.specPbGz = specPbGz
-	o.specBytesETag = specBytesETag
-	o.specPbETag = specPbETag
-	o.specPbGzETag = specPbGzETag
-	o.lastModified = lastModified
-
+func (o *OpenAPIService) UpdateSpec(swagger *spec.Swagger) error {
+	o.UpdateSpecLazy(cached.Static(swagger, uuid.New().String()))
 	return nil
 }
 
-func toProtoBinary(spec []byte) ([]byte, error) {
-	var info yaml.MapSlice
-	err := yaml.Unmarshal(spec, &info)
-	if err != nil {
-		return nil, err
-	}
-	document, err := openapi_v2.NewDocument(info, compiler.NewContext("$root", nil))
+func (o *OpenAPIService) UpdateSpecLazy(swagger cached.Value[*spec.Swagger]) {
+	o.specCache.Store(swagger)
+}
+
+func ToProtoBinary(json []byte) ([]byte, error) {
+	document, err := openapi_v2.ParseDocument(json)
 	if err != nil {
 		return nil, err
 	}
 	return proto.Marshal(document)
 }
 
-func toGzip(data []byte) []byte {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	zw.Write(data)
-	zw.Close()
-	return buf.Bytes()
+// RegisterOpenAPIVersionedService registers a handler to provide access to provided swagger spec.
+//
+// Deprecated: use OpenAPIService.RegisterOpenAPIVersionedService instead.
+func RegisterOpenAPIVersionedService(spec *spec.Swagger, servePath string, handler common.PathHandler) *OpenAPIService {
+	o := NewOpenAPIService(spec)
+	o.RegisterOpenAPIVersionedService(servePath, handler)
+	return o
 }
 
 // RegisterOpenAPIVersionedService registers a handler to provide access to provided swagger spec.
-func RegisterOpenAPIVersionedService(openapiSpec *spec.Swagger, servePath string, handler common.PathHandler) (*OpenAPIService, error) {
-	o := OpenAPIService{}
-	if err := o.UpdateSpec(openapiSpec); err != nil {
-		return nil, err
-	}
-
+func (o *OpenAPIService) RegisterOpenAPIVersionedService(servePath string, handler common.PathHandler) {
 	accepted := []struct {
-		Type           string
-		SubType        string
-		GetDataAndETag func() ([]byte, string, time.Time)
+		Type                string
+		SubType             string
+		ReturnedContentType string
+		GetDataAndEtag      cached.Value[timedSpec]
 	}{
-		{"application", "json", o.getSwaggerBytes},
-		{"application", "com.github.proto-openapi.spec.v2@v1.0+protobuf", o.getSwaggerPbBytes},
+		{"application", subTypeJSON, "application/" + subTypeJSON, o.jsonCache},
+		{"application", subTypeProtobufDeprecated, "application/" + subTypeProtobuf, o.protoCache},
+		{"application", subTypeProtobuf, "application/" + subTypeProtobuf, o.protoCache},
 	}
 
 	handler.Handle(servePath, gziphandler.GzipHandler(http.HandlerFunc(
@@ -243,12 +154,23 @@ func RegisterOpenAPIVersionedService(openapiSpec *spec.Swagger, servePath string
 					if clause.SubType != accepts.SubType && clause.SubType != "*" {
 						continue
 					}
-
 					// serve the first matching media type in the sorted clause list
-					data, etag, lastModified := accepts.GetDataAndETag()
-					w.Header().Set("Etag", etag)
+					ts, etag, err := accepts.GetDataAndEtag.Get()
+					if err != nil {
+						klog.Errorf("Error in OpenAPI handler: %s", err)
+						// only return a 503 if we have no older cache data to serve
+						if ts.spec == nil {
+							w.WriteHeader(http.StatusServiceUnavailable)
+							return
+						}
+					}
+					// Set Content-Type header in the reponse
+					w.Header().Set("Content-Type", accepts.ReturnedContentType)
+
+					// ETag must be enclosed in double quotes: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
+					w.Header().Set("Etag", strconv.Quote(etag))
 					// ServeContent will take care of caching using eTag.
-					http.ServeContent(w, r, servePath, lastModified, bytes.NewReader(data))
+					http.ServeContent(w, r, servePath, ts.lastModified, bytes.NewReader(ts.spec))
 					return
 				}
 			}
@@ -257,16 +179,24 @@ func RegisterOpenAPIVersionedService(openapiSpec *spec.Swagger, servePath string
 			return
 		}),
 	))
-
-	return &o, nil
 }
 
 // BuildAndRegisterOpenAPIVersionedService builds the spec and registers a handler to provide access to it.
 // Use this method if your OpenAPI spec is static. If you want to update the spec, use BuildOpenAPISpec then RegisterOpenAPIVersionedService.
+//
+// Deprecated: BuildAndRegisterOpenAPIVersionedServiceFromRoutes should be used instead.
 func BuildAndRegisterOpenAPIVersionedService(servePath string, webServices []*restful.WebService, config *common.Config, handler common.PathHandler) (*OpenAPIService, error) {
-	spec, err := builder.BuildOpenAPISpec(webServices, config)
+	return BuildAndRegisterOpenAPIVersionedServiceFromRoutes(servePath, restfuladapter.AdaptWebServices(webServices), config, handler)
+}
+
+// BuildAndRegisterOpenAPIVersionedServiceFromRoutes builds the spec and registers a handler to provide access to it.
+// Use this method if your OpenAPI spec is static. If you want to update the spec, use BuildOpenAPISpec then RegisterOpenAPIVersionedService.
+func BuildAndRegisterOpenAPIVersionedServiceFromRoutes(servePath string, routeContainers []common.RouteContainer, config *common.Config, handler common.PathHandler) (*OpenAPIService, error) {
+	spec, err := builder.BuildOpenAPISpecFromRoutes(routeContainers, config)
 	if err != nil {
 		return nil, err
 	}
-	return RegisterOpenAPIVersionedService(spec, servePath, handler)
+	o := NewOpenAPIService(spec)
+	o.RegisterOpenAPIVersionedService(servePath, handler)
+	return o, nil
 }

@@ -21,8 +21,9 @@ import (
 	"sort"
 	"strings"
 
-	"k8s.io/gengo/examples/set-gen/sets"
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2"
+	"k8s.io/gengo/v2/types"
+	"k8s.io/kube-openapi/pkg/util/sets"
 )
 
 const extensionPrefix = "x-kubernetes-"
@@ -32,27 +33,43 @@ type extensionAttributes struct {
 	xName         string
 	kind          types.Kind
 	allowedValues sets.String
+	enforceArray  bool
 }
 
 // Extension tag to openapi extension attributes
 var tagToExtension = map[string]extensionAttributes{
-	"patchMergeKey": extensionAttributes{
+	"patchMergeKey": {
 		xName: "x-kubernetes-patch-merge-key",
 		kind:  types.Slice,
 	},
-	"patchStrategy": extensionAttributes{
+	"patchStrategy": {
 		xName:         "x-kubernetes-patch-strategy",
 		kind:          types.Slice,
 		allowedValues: sets.NewString("merge", "retainKeys"),
 	},
-	"listMapKey": extensionAttributes{
-		xName: "x-kubernetes-list-map-keys",
-		kind:  types.Slice,
+	"listMapKey": {
+		xName:        "x-kubernetes-list-map-keys",
+		kind:         types.Slice,
+		enforceArray: true,
 	},
-	"listType": extensionAttributes{
+	"listType": {
 		xName:         "x-kubernetes-list-type",
 		kind:          types.Slice,
 		allowedValues: sets.NewString("atomic", "set", "map"),
+	},
+	"mapType": {
+		xName:         "x-kubernetes-map-type",
+		kind:          types.Map,
+		allowedValues: sets.NewString("atomic", "granular"),
+	},
+	"structType": {
+		xName:         "x-kubernetes-map-type",
+		kind:          types.Struct,
+		allowedValues: sets.NewString("atomic", "granular"),
+	},
+	"validations": {
+		xName: "x-kubernetes-validations",
+		kind:  types.Slice,
 	},
 }
 
@@ -113,6 +130,10 @@ func (e extension) hasMultipleValues() bool {
 	return len(e.values) > 1
 }
 
+func (e extension) isAlwaysArrayFormat() bool {
+	return tagToExtension[e.idlTag].enforceArray
+}
+
 // Returns sorted list of map keys. Needed for deterministic testing.
 func sortedMapKeys(m map[string][]string) []string {
 	keys := make([]string, len(m))
@@ -151,7 +172,7 @@ func parseExtensions(comments []string) ([]extension, []error) {
 		}
 	}
 	// Next, generate extensions from "idlTags" (e.g. +listType)
-	tagValues := types.ExtractCommentTags("+", comments)
+	tagValues := gengo.ExtractCommentTags("+", comments)
 	for _, idlTag := range sortedMapKeys(tagValues) {
 		xAttrs, exists := tagToExtension[idlTag]
 		if !exists {
